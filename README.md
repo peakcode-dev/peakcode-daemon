@@ -36,11 +36,13 @@ The binary exposes six modes:
 ```text
 peakcode-daemon daemon
 peakcode-daemon daemonize
-peakcode-daemon worker --session <UUID> --ipc <PATH>
+peakcode-daemon worker --session <ID> --ipc <PATH>
 peakcode-daemon start
 peakcode-daemon stop
 peakcode-daemon status
 ```
+
+For `worker`, `--session <ID>` supplies the daemon session identifier.
 
 Running `peakcode-daemon` without a subcommand is equivalent to `peakcode-daemon daemon` and
 runs in the foreground. These modes are command-surface stubs in pre-alpha; daemon, worker,
