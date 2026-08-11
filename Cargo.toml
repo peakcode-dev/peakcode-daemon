@@ -6,6 +6,7 @@ license = "MIT"
 description = "Long-running supervisor and gRPC gateway for peakcode agent sessions"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 peakcode-core = { path = "../peakcode-core", version = "0.1.0" }
 tokio = { version = "1", features = ["full"] }
 tonic = "0.12"

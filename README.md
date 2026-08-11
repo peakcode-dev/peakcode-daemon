@@ -29,6 +29,23 @@ cargo build
 
 The build uses vendored `protoc`; no system Protocol Buffers compiler is required.
 
+## Usage
+
+The binary exposes six modes:
+
+```text
+peakcode-daemon daemon
+peakcode-daemon daemonize
+peakcode-daemon worker --session <UUID> --ipc <PATH>
+peakcode-daemon start
+peakcode-daemon stop
+peakcode-daemon status
+```
+
+Running `peakcode-daemon` without a subcommand is equivalent to `peakcode-daemon daemon` and
+runs in the foreground. These modes are command-surface stubs in pre-alpha; daemon, worker,
+daemonization, and lifecycle behavior will land in later tasks.
+
 ## Test
 
 ```bash
