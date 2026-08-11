@@ -21,6 +21,12 @@ The protocol uses newline-delimited JSON (NDJSON):
 - End of file with no pending frame bytes means the peer closed its side of the connection.
 - Each worker has one dedicated command-reader task, so concurrent outbound events cannot cancel an
   in-progress read and discard part of a fragmented command frame.
+- Worker events pass through one bounded channel and one writer task. The coordinator retains at
+  most one additional mapped event while waiting for channel capacity, so it can continue handling
+  `cancel` and `stop` under socket backpressure without reordering ordinary events.
+- `stop` allows up to 250 ms to enqueue `done`. Final reader, active-turn, and writer cleanup each
+  use a 250 ms deadline. If the peer does not drain output, `done` is best-effort and the blocked
+  writer task is aborted after its deadline so the worker can exit.
 
 Every frame has a string `kind` discriminator encoded in `snake_case`. Frames sent by workers are
 `WorkerEvent` values. Frames sent by the daemon are `DaemonCommand` values.
@@ -66,7 +72,10 @@ when they need structured tool arguments.
 4. The worker emits `turn_finished` when the turn ends and remains available for later input.
 
 Each worker runs at most one agent turn at a time. Additional `input` commands received during an
-active turn are queued in socket order and start after the current turn finishes.
+active turn are queued in socket order and start after the current turn finishes. A worker retains
+at most 32 queued inputs. The 33rd input emits a sanitized `crash` stating that the input queue limit
+was exceeded, terminates that worker session, and follows bounded writer cleanup. Inputs are never
+silently dropped.
 
 Input is scoped by the socket connection. Frames do not carry a session ID because each supervised
 worker connection belongs to exactly one daemon session.
@@ -86,14 +95,26 @@ it emits `tool_start`. Waiting for `tool_start` to announce the approval would d
 call. If the event cannot be delivered or the response waiter closes, the adapter denies the tool
 call. Duplicate pending IDs are also denied rather than replacing an existing waiter.
 
+Each pending registration has a unique generation token and cancellation-safe drop guard. Aborting
+an approval future removes only its own generation, so a stale cleanup cannot delete or resolve a
+later request that reuses the same `call_id`.
+
+An `allow_all` decision is retained by the worker approval adapter for the rest of that worker
+session. Later turns can run the same tool without another `needs_approval`; unrelated tools still
+require their own decision.
+
 All worker events, including approval requests and forwarded peakcode-core events, pass through one
 bounded channel and one writer task. Only that task writes NDJSON bytes to the socket, preventing
 concurrent producers from interleaving frames.
 
 ## Cancel and stop
 
-`cancel` interrupts only the active turn. The worker remains alive, preserves the session, and can
-accept a later `input` command. If no turn is active, cancellation is a safe no-op.
+`cancel` aborts the active peakcode-core agent task and waits for cancellation to complete before
+clearing any remaining approval waiters. The worker retains history from completed turns, discards
+the canceled turn's partial history, and remains available for later input. If no turn is active,
+cancellation is a safe no-op. On Unix, peakcode-core starts each bash tool in its own process group;
+aborting the agent drops the tool guard and sends `SIGKILL` to that group so descendants do not
+survive cancellation.
 
 `stop` ends the session permanently. The worker must stop accepting input, perform bounded cleanup,
 emit `done` with the final in-memory message count, and exit. A frontend detach is neither `cancel`
@@ -109,6 +130,15 @@ nor `stop`; disconnecting a frontend must not change the worker lifetime.
   daemon supervisor or unrelated workers.
 - Producers must never place API keys, authentication tokens, private keys, credentials, or other
   secrets in frames. This applies to free-form text, errors, tool arguments, and tool results.
+- Immediately before serialization, the single writer redacts every string-bearing worker event.
+  Redaction inputs include the active provider API key and values of environment variables whose
+  names indicate passwords, tokens, secrets, API keys, private keys, credentials, authentication,
+  database URLs, Redis URLs, or DSNs. Common bearer/token forms and PEM private-key blocks are also
+  redacted. The replacement is the deterministic string `[REDACTED]`.
+- Secret-bearing tool-call IDs receive stable, unique per-worker aliases when approval waiters are
+  registered. The same alias is used by approval and tool events, preserving correlation without
+  putting the original ID on the wire or collapsing distinct IDs. Worker errors returned to the
+  process boundary are generic after a detailed, redacted `crash` event.
 - Receivers must treat all free-form strings and nested `arguments_json` values as untrusted data.
 - The internal UDS must not be exposed as the frontend API. Frontends use the separately managed,
   typed gRPC UDS.
