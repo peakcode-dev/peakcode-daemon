@@ -13,8 +13,12 @@ The protocol uses newline-delimited JSON (NDJSON):
 - Each line contains exactly one frame. JSON objects cannot span lines.
 - The serialized JSON object can be at most 1 MiB (`1,048,576` bytes), excluding its terminating
   line feed.
+- Receivers enforce the size limit incrementally before copying each input chunk, so an
+  unterminated frame cannot cause unbounded allocation.
+- The line-feed byte is mandatory and is the only byte removed before JSON deserialization. A
+  non-empty fragment followed by end of file is invalid rather than a completed frame.
 - The daemon and worker flush each frame after writing it.
-- End of file means the peer closed its side of the connection.
+- End of file with no pending frame bytes means the peer closed its side of the connection.
 
 Every frame has a string `kind` discriminator encoded in `snake_case`. Frames sent by workers are
 `WorkerEvent` values. Frames sent by the daemon are `DaemonCommand` values.
@@ -84,9 +88,10 @@ the worker lifetime.
 
 - Protocol evolution is additive. New `WorkerEvent` and `DaemonCommand` variants may be added, but
   existing kinds, fields, decision values, and semantics must not be renamed, removed, or changed.
-- An unknown, malformed, invalid UTF-8, or oversized frame is rejected. The receiver must close the
-  affected worker connection or otherwise handle the protocol failure safely without terminating
-  the daemon supervisor or unrelated workers.
+- An unknown, malformed, invalid UTF-8, oversized, or unterminated frame is rejected with
+  `InvalidData`. This error is terminal for the stream: the receiver must close the affected worker
+  connection without attempting to read another frame. The protocol failure must not terminate the
+  daemon supervisor or unrelated workers.
 - Producers must never place API keys, authentication tokens, private keys, credentials, or other
   secrets in frames. This applies to free-form text, errors, tool arguments, and tool results.
 - Receivers must treat all free-form strings and nested `arguments_json` values as untrusted data.

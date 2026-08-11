@@ -81,18 +81,43 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 pub async fn read_frame<R: AsyncBufRead + Unpin, T: DeserializeOwned>(
     r: &mut R,
 ) -> io::Result<Option<T>> {
-    let mut buf = String::new();
-    let n = r.read_line(&mut buf).await?;
-    if n == 0 {
-        return Ok(None);
+    let mut payload = Vec::new();
+    loop {
+        let available = r.fill_buf().await?;
+        if available.is_empty() {
+            if payload.is_empty() {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC frame missing newline delimiter",
+            ));
+        }
+
+        if let Some(pos) = available.iter().position(|byte| *byte == b'\n') {
+            if pos > MAX_IPC_FRAME_BYTES - payload.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "IPC frame exceeds maximum size",
+                ));
+            }
+            payload.extend_from_slice(&available[..pos]);
+            r.consume(pos + 1);
+            break;
+        }
+
+        let available_len = available.len();
+        if available_len > MAX_IPC_FRAME_BYTES - payload.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC frame exceeds maximum size",
+            ));
+        }
+        payload.extend_from_slice(available);
+        r.consume(available_len);
     }
-    if buf.len() > MAX_IPC_FRAME_BYTES + 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "IPC frame exceeds maximum size",
-        ));
-    }
-    let frame = serde_json::from_str(buf.trim_end())
+
+    let frame = serde_json::from_slice(&payload)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(Some(frame))
 }

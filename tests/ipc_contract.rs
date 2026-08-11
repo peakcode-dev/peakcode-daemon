@@ -4,6 +4,7 @@ use peakcode_daemon::ipc::{
     read_frame, write_frame, DaemonCommand, IpcApprovalDecision, WorkerEvent, MAX_IPC_FRAME_BYTES,
 };
 use tokio::io::{duplex, AsyncWriteExt, BufReader};
+use tokio::time::{timeout, Duration};
 
 #[tokio::test]
 async fn worker_text_delta_roundtrips() {
@@ -79,4 +80,55 @@ async fn oversized_write_returns_invalid_data() {
     let error = write_frame(&mut writer, &event).await.unwrap_err();
 
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn missing_newline_before_eof_is_rejected() {
+    let (mut writer, reader) = duplex(64);
+    writer.write_all(br#"{"kind":"cancel"}"#).await.unwrap();
+    writer.shutdown().await.unwrap();
+
+    let error = read_frame::<_, DaemonCommand>(&mut BufReader::new(reader))
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn oversized_inbound_frame_is_rejected_without_waiting_for_newline() {
+    let (mut writer, reader) = duplex(64);
+    let writer_task = tokio::spawn(async move {
+        writer
+            .write_all(&vec![b'x'; MAX_IPC_FRAME_BYTES + 1])
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    });
+
+    let error = timeout(
+        Duration::from_secs(1),
+        read_frame::<_, DaemonCommand>(&mut BufReader::new(reader)),
+    )
+    .await
+    .expect("reader waited for a newline or EOF after crossing the frame limit")
+    .unwrap_err();
+    writer_task.abort();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn max_sized_inbound_frame_is_accepted() {
+    let mut payload = br#"{"kind":"cancel"}"#.to_vec();
+    payload.resize(MAX_IPC_FRAME_BYTES, b' ');
+    payload.push(b'\n');
+
+    let (mut writer, reader) = duplex(64);
+    let writer_task = tokio::spawn(async move { writer.write_all(&payload).await });
+
+    let actual = read_frame(&mut BufReader::new(reader)).await.unwrap();
+    writer_task.await.unwrap().unwrap();
+
+    assert_eq!(actual, Some(DaemonCommand::Cancel));
 }
