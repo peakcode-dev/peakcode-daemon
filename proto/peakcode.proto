@@ -1,0 +1,131 @@
+syntax = "proto3";
+
+package peakcode.daemon.v1;
+
+import "google/protobuf/empty.proto";
+
+service SessionService {
+  rpc CreateSession(CreateSessionRequest) returns (Session);
+  rpc ListSessions(google.protobuf.Empty) returns (SessionList);
+  rpc GetSession(SessionId) returns (Session);
+  rpc StopSession(StopSessionRequest) returns (google.protobuf.Empty);
+}
+
+service AttachService {
+  rpc Attach(stream ClientCommand) returns (stream DaemonEvent);
+}
+
+message SessionId {
+  string id = 1;
+}
+
+message Session {
+  string id = 1;
+  int64 created_at_unix_ms = 2;
+  SessionStatus status = 3;
+  string model = 4;
+  string workdir = 5;
+}
+
+enum SessionStatus {
+  SESSION_STATUS_UNSPECIFIED = 0;
+  SESSION_STATUS_IDLE = 1;
+  SESSION_STATUS_RUNNING = 2;
+  SESSION_STATUS_STOPPED = 3;
+  SESSION_STATUS_CRASHED = 4;
+}
+
+message CreateSessionRequest {
+  string model = 1;
+  string system_prompt = 2;
+  string workdir = 3;
+}
+
+message SessionList {
+  repeated Session sessions = 1;
+}
+
+message StopSessionRequest {
+  string id = 1;
+}
+
+message ClientCommand {
+  string session_id = 1;
+  oneof body {
+    SendInput send_input = 2;
+    ApproveTool approve_tool = 3;
+    Cancel cancel = 4;
+    Detach detach = 5;
+  }
+}
+
+message SendInput {
+  string text = 1;
+}
+
+message ApproveTool {
+  string call_id = 1;
+  ApprovalDecision decision = 2;
+}
+
+enum ApprovalDecision {
+  APPROVAL_DECISION_UNSPECIFIED = 0;
+  APPROVAL_DECISION_ALLOW = 1;
+  APPROVAL_DECISION_DENY = 2;
+  APPROVAL_DECISION_ALLOW_ALL = 3;
+}
+
+message Cancel {}
+message Detach {}
+
+message DaemonEvent {
+  string session_id = 1;
+  uint64 seq = 2;
+  oneof body {
+    TextDelta text_delta = 3;
+    AssistantMessage assistant_message = 4;
+    ToolStart tool_start = 5;
+    ToolResult tool_result = 6;
+    NeedsApproval needs_approval = 7;
+    TurnFinished turn_finished = 8;
+    SessionEnded session_ended = 9;
+    ErrorEvent error = 10;
+  }
+}
+
+message TextDelta {
+  string text = 1;
+}
+
+message AssistantMessage {
+  string text = 1;
+}
+
+message ToolStart {
+  string call_id = 1;
+  string name = 2;
+  string arguments_json = 3;
+}
+
+message ToolResult {
+  string call_id = 1;
+  string name = 2;
+  string content = 3;
+  bool is_error = 4;
+}
+
+message NeedsApproval {
+  string call_id = 1;
+  string tool = 2;
+  string arguments_json = 3;
+}
+
+message TurnFinished {}
+
+message SessionEnded {
+  string reason = 1;
+}
+
+message ErrorEvent {
+  string message = 1;
+}
