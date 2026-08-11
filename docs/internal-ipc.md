@@ -19,6 +19,8 @@ The protocol uses newline-delimited JSON (NDJSON):
   non-empty fragment followed by end of file is invalid rather than a completed frame.
 - The daemon and worker flush each frame after writing it.
 - End of file with no pending frame bytes means the peer closed its side of the connection.
+- Each worker has one dedicated command-reader task, so concurrent outbound events cannot cancel an
+  in-progress read and discard part of a fragmented command frame.
 
 Every frame has a string `kind` discriminator encoded in `snake_case`. Frames sent by workers are
 `WorkerEvent` values. Frames sent by the daemon are `DaemonCommand` values.
@@ -63,17 +65,30 @@ when they need structured tool arguments.
 3. The worker processes the turn and emits ordered worker events.
 4. The worker emits `turn_finished` when the turn ends and remains available for later input.
 
+Each worker runs at most one agent turn at a time. Additional `input` commands received during an
+active turn are queued in socket order and start after the current turn finishes.
+
 Input is scoped by the socket connection. Frames do not carry a session ID because each supervised
 worker connection belongs to exactly one daemon session.
 
 ## Approval flow
 
-1. The worker emits `needs_approval` with a `call_id`, tool name, and JSON-encoded arguments.
+1. The worker's approval adapter registers a waiter keyed by `call_id`, then immediately emits
+   `needs_approval` with the same ID, tool name, and JSON-encoded arguments.
 2. The worker keeps that call pending and does not execute it before a decision arrives.
 3. A frontend resolves the request through gRPC, and the daemon writes `approve` with the same
    `call_id` and a typed decision.
 4. The worker applies the decision only to the matching pending call. Unknown, stale, or
    already-resolved call IDs must be rejected safely.
+
+The approval adapter emits `needs_approval` itself because peakcode-core requests approval before
+it emits `tool_start`. Waiting for `tool_start` to announce the approval would deadlock the tool
+call. If the event cannot be delivered or the response waiter closes, the adapter denies the tool
+call. Duplicate pending IDs are also denied rather than replacing an existing waiter.
+
+All worker events, including approval requests and forwarded peakcode-core events, pass through one
+bounded channel and one writer task. Only that task writes NDJSON bytes to the socket, preventing
+concurrent producers from interleaving frames.
 
 ## Cancel and stop
 
@@ -81,8 +96,8 @@ worker connection belongs to exactly one daemon session.
 accept a later `input` command. If no turn is active, cancellation is a safe no-op.
 
 `stop` ends the session permanently. The worker must stop accepting input, perform bounded cleanup,
-and exit. A frontend detach is neither `cancel` nor `stop`; disconnecting a frontend must not change
-the worker lifetime.
+emit `done` with the final in-memory message count, and exit. A frontend detach is neither `cancel`
+nor `stop`; disconnecting a frontend must not change the worker lifetime.
 
 ## Compatibility and safety
 

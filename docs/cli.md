@@ -13,8 +13,11 @@ peakcode-daemon exposes six process and lifecycle modes:
 
 Running `peakcode-daemon` without a subcommand selects `daemon` mode.
 
-For `worker`, `--session <ID>` supplies the daemon session identifier.
+For `worker`, `--session <ID>` supplies the daemon session identifier and `--ipc <PATH>` selects its
+private worker socket. Worker mode connects to that UDS, loads peakcode-core configuration, runs
+OpenAI-backed agent turns, and streams typed internal IPC events until it receives `stop` or the
+daemon connection closes. `cancel` aborts only the active turn, so the worker can accept later input.
 
-All modes are command-surface stubs in pre-alpha. They currently identify the selected mode and
-exit successfully. Daemon supervision, worker execution, daemonization, and lifecycle behavior
-will land in later tasks.
+Worker mode is implemented. Daemon supervision, daemonization, and lifecycle modes remain
+command-surface stubs in pre-alpha and currently identify the selected mode before exiting
+successfully.

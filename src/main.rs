@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         Mode::Worker {
             session_id,
             ipc_path,
-        } => println!("peakcode-daemon: worker mode (session: {session_id}, ipc: {ipc_path})"),
+        } => peakcode_daemon::worker::run(session_id, ipc_path).await?,
         Mode::Start => println!("peakcode-daemon: start mode"),
         Mode::Stop => println!("peakcode-daemon: stop mode"),
         Mode::Status => println!("peakcode-daemon: status mode"),
