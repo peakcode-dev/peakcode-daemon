@@ -14,18 +14,20 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use crate::call_id_mapper::CallIdMapper;
 use crate::ipc::{read_frame, write_frame, DaemonCommand, WorkerEvent};
 use crate::redaction::Redactor;
-use crate::remote_approver::RemoteApprover;
+use crate::remote_approver::{ApprovalNotice, RemoteApprover};
 
 const WORKER_EVENT_CHANNEL_CAPACITY: usize = 64;
 const WORKER_COMMAND_CHANNEL_CAPACITY: usize = 64;
+const WORKER_APPROVAL_CHANNEL_CAPACITY: usize = 64;
 const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Maximum user inputs retained behind one active agent turn.
 pub const MAX_QUEUED_INPUTS: usize = 32;
 
 struct ActiveTurn {
-    events: mpsc::UnboundedReceiver<AgentEvent>,
+    events: mpsc::Receiver<AgentEvent>,
     handle: JoinHandle<anyhow::Result<Vec<Message>>>,
 }
 
@@ -70,6 +72,7 @@ async fn run_connection(
 ) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let redactor = Arc::new(Redactor::from_env(&provider_config.api_key));
+    let call_ids = Arc::new(CallIdMapper::default());
     let mut socket_reader = BufReader::new(read_half);
     let (command_tx, mut command_rx) = mpsc::channel(WORKER_COMMAND_CHANNEL_CAPACITY);
     let command_reader = tokio::spawn(async move {
@@ -89,6 +92,7 @@ async fn run_connection(
         }
     });
     let (event_tx, mut event_rx) = mpsc::channel(WORKER_EVENT_CHANNEL_CAPACITY);
+    let (approval_tx, mut approval_rx) = mpsc::channel(WORKER_APPROVAL_CHANNEL_CAPACITY);
     let writer_redactor = Arc::clone(&redactor);
     let writer = tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
@@ -96,10 +100,14 @@ async fn run_connection(
         }
         Ok::<(), std::io::Error>(())
     });
-    let approver = Arc::new(RemoteApprover::with_redactor(event_tx.clone(), redactor));
+    let approver = Arc::new(RemoteApprover::with_call_ids(
+        approval_tx,
+        Arc::clone(&call_ids),
+    ));
     let mut active: Option<ActiveTurn> = None;
     let mut queued_inputs = VecDeque::new();
     let mut pending_event = None;
+    let mut approval_barrier = None;
 
     let result = 'worker: loop {
         if active.is_none() {
@@ -139,6 +147,27 @@ async fn run_connection(
             continue;
         }
 
+        if pending_event.is_none() && approval_barrier.is_some() {
+            let turn = active.as_mut().expect("active turn was checked");
+            match turn.events.try_recv() {
+                Ok(event) => {
+                    pending_event = Some(map_agent_event(&call_ids, event));
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    pending_event = Some(map_approval_notice(
+                        approval_barrier
+                            .take()
+                            .expect("approval barrier was checked"),
+                    ));
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    approval_barrier = None;
+                }
+            }
+        }
+
         let turn = active.as_mut().expect("active turn was checked");
         tokio::select! {
             command = command_rx.recv() => {
@@ -165,18 +194,34 @@ async fn run_connection(
                         }
                     }
                     Some(Ok(DaemonCommand::Cancel)) => {
-                        if let Some(turn) = active.take() {
-                            cancel_active_turn(turn, &approver).await;
+                        let cancellation = if let Some(turn) = active.take() {
+                            cancel_active_turn(turn, &approver).await
                         } else {
                             approver.cancel_pending().await;
-                        }
+                            Ok(())
+                        };
+                        call_ids.clear();
+                        approval_barrier = None;
+                        drain_approval_notices(&mut approval_rx);
                         pending_event = None;
+                        if let Err(error) = cancellation {
+                            send_terminal_event(
+                                &event_tx,
+                                WorkerEvent::Crash {
+                                    message: error.to_string(),
+                                },
+                            )
+                            .await;
+                            break 'worker Err(error);
+                        }
                     }
                     Some(Ok(DaemonCommand::Stop)) => {
                         if let Some(turn) = active.take() {
                             abort_turn(turn).await;
                         }
                         approver.cancel_pending().await;
+                        call_ids.clear();
+                        drain_approval_notices(&mut approval_rx);
                         send_done(&event_tx, messages.len()).await;
                         break 'worker Ok(());
                     }
@@ -190,9 +235,15 @@ async fn run_connection(
                     Err(_) => break 'worker Err(anyhow!("worker event writer closed")),
                 }
             }
-            event = turn.events.recv(), if pending_event.is_none() => {
+            notice = approval_rx.recv(), if approval_barrier.is_none() => {
+                match notice {
+                    Some(notice) => approval_barrier = Some(notice),
+                    None => break 'worker Err(anyhow!("worker approval channel closed")),
+                }
+            }
+            event = turn.events.recv(), if pending_event.is_none() && approval_barrier.is_none() => {
                 match event {
-                    Some(event) => pending_event = Some(map_agent_event(event)),
+                    Some(event) => pending_event = Some(map_agent_event(&call_ids, event)),
                     None => {
                         let turn = active.take().expect("active turn was checked");
                         match turn.handle.await {
@@ -204,6 +255,8 @@ async fn run_connection(
                             }
                             Err(error) => break 'worker Err(error.into()),
                         }
+                        call_ids.clear();
+                        drain_approval_notices(&mut approval_rx);
                     }
                 }
             }
@@ -214,6 +267,8 @@ async fn run_connection(
         abort_turn(turn).await;
     }
     approver.cancel_pending().await;
+    call_ids.clear();
+    drain_approval_notices(&mut approval_rx);
     command_reader.abort();
     let command_reader_result = timeout(WORKER_SHUTDOWN_TIMEOUT, command_reader).await;
     drop(approver);
@@ -259,10 +314,21 @@ async fn abort_turn(mut turn: ActiveTurn) {
     let _ = timeout(WORKER_SHUTDOWN_TIMEOUT, &mut turn.handle).await;
 }
 
-async fn cancel_active_turn(turn: ActiveTurn, approver: &RemoteApprover) {
+async fn cancel_active_turn(turn: ActiveTurn, approver: &RemoteApprover) -> anyhow::Result<()> {
     turn.handle.abort();
-    let _ = turn.handle.await;
+    let mut waiter = tokio::spawn(async move {
+        let _ = turn.handle.await;
+    });
+    let completed = timeout(WORKER_SHUTDOWN_TIMEOUT, &mut waiter).await.is_ok();
+    if !completed {
+        waiter.abort();
+    }
     approver.cancel_pending().await;
+    if completed {
+        Ok(())
+    } else {
+        Err(anyhow!("agent cancellation cleanup deadline exceeded"))
+    }
 }
 
 async fn start_turn(
@@ -289,7 +355,7 @@ async fn start_turn(
     ActiveTurn { events, handle }
 }
 
-fn map_agent_event(event: AgentEvent) -> WorkerEvent {
+fn map_agent_event(call_ids: &CallIdMapper, event: AgentEvent) -> WorkerEvent {
     match event {
         AgentEvent::TextDelta(text) => WorkerEvent::TextDelta { text },
         AgentEvent::AssistantMessage(message) => WorkerEvent::AssistantMessage {
@@ -300,7 +366,7 @@ fn map_agent_event(event: AgentEvent) -> WorkerEvent {
             name,
             arguments,
         } => WorkerEvent::ToolStart {
-            call_id,
+            call_id: call_ids.start_event(&call_id),
             name,
             arguments_json: arguments.to_string(),
         },
@@ -309,13 +375,25 @@ fn map_agent_event(event: AgentEvent) -> WorkerEvent {
             name,
             output,
         } => WorkerEvent::ToolResult {
-            call_id,
+            call_id: call_ids.finish(&call_id),
             name,
             content: output.content,
             is_error: output.is_error,
         },
         AgentEvent::TurnFinished => WorkerEvent::TurnFinished,
     }
+}
+
+fn map_approval_notice(notice: ApprovalNotice) -> WorkerEvent {
+    WorkerEvent::NeedsApproval {
+        call_id: notice.call_id,
+        tool: notice.tool,
+        arguments_json: notice.arguments_json,
+    }
+}
+
+fn drain_approval_notices(approvals: &mut mpsc::Receiver<ApprovalNotice>) {
+    while approvals.try_recv().is_ok() {}
 }
 
 #[cfg(test)]
@@ -673,6 +751,7 @@ mod tests {
     struct SlowCancelStream {
         emitted: bool,
         canceled: Arc<AtomicBool>,
+        cancel_delay: Duration,
     }
 
     impl Stream for SlowCancelStream {
@@ -690,7 +769,7 @@ mod tests {
 
     impl Drop for SlowCancelStream {
         fn drop(&mut self) {
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(self.cancel_delay);
             self.canceled.store(true, Ordering::SeqCst);
         }
     }
@@ -698,6 +777,45 @@ mod tests {
     struct CancellationOrderProvider {
         calls: AtomicUsize,
         canceled: Arc<AtomicBool>,
+        cancel_delay: Duration,
+    }
+
+    struct ReusedProviderCallIdProvider;
+
+    #[async_trait]
+    impl Provider for ReusedProviderCallIdProvider {
+        fn name(&self) -> &str {
+            "reused-provider-call-id"
+        }
+
+        async fn stream(
+            &self,
+            messages: &[Message],
+            _tools: &[peakcode_core::ToolSchema],
+            _config: &ProviderConfig,
+        ) -> Result<ProviderStream, ProviderError> {
+            if messages
+                .last()
+                .is_some_and(|message| message.role == Role::Tool)
+            {
+                return Ok(stream(vec![ProviderEvent::Finish {
+                    reason: FinishReason::Stop,
+                }]));
+            }
+            Ok(stream(vec![
+                ProviderEvent::ToolCallStart {
+                    id: "reused-provider-id".to_owned(),
+                    name: "mutate".to_owned(),
+                },
+                ProviderEvent::ToolCallArgsDelta {
+                    id: "reused-provider-id".to_owned(),
+                    delta: "{}".to_owned(),
+                },
+                ProviderEvent::Finish {
+                    reason: FinishReason::ToolUse,
+                },
+            ]))
+        }
     }
 
     #[async_trait]
@@ -722,6 +840,7 @@ mod tests {
                 1 => Ok(Box::pin(SlowCancelStream {
                     emitted: false,
                     canceled: Arc::clone(&self.canceled),
+                    cancel_delay: self.cancel_delay,
                 })),
                 _ => {
                     let has_completed = messages
@@ -928,16 +1047,22 @@ mod tests {
         .await
         .unwrap();
 
-        loop {
-            if matches!(next_event(&mut reader).await, WorkerEvent::NeedsApproval { call_id, tool, arguments_json } if call_id == "tool-1" && tool == "mutate" && arguments_json == "{}")
+        let approval_handle = loop {
+            if let WorkerEvent::NeedsApproval {
+                call_id,
+                tool,
+                arguments_json,
+            } = next_event(&mut reader).await
             {
-                break;
+                assert_eq!(tool, "mutate");
+                assert_eq!(arguments_json, "{}");
+                break call_id;
             }
-        }
+        };
         write_frame(
             &mut write,
             &DaemonCommand::Approve {
-                call_id: "tool-1".to_owned(),
+                call_id: approval_handle.clone(),
                 decision: IpcApprovalDecision::Allow,
             },
         )
@@ -948,7 +1073,7 @@ mod tests {
         let mut saw_result = false;
         loop {
             match next_event(&mut reader).await {
-                WorkerEvent::ToolStart { call_id, .. } if call_id == "tool-1" => {
+                WorkerEvent::ToolStart { call_id, .. } if call_id == approval_handle => {
                     saw_start = true;
                 }
                 WorkerEvent::ToolResult {
@@ -956,7 +1081,7 @@ mod tests {
                     content,
                     is_error,
                     ..
-                } if call_id == "tool-1" && content == "changed" && !is_error => {
+                } if call_id == approval_handle && content == "changed" && !is_error => {
                     saw_result = true;
                 }
                 WorkerEvent::TurnFinished => break,
@@ -1314,6 +1439,7 @@ mod tests {
         let provider = Arc::new(CancellationOrderProvider {
             calls: AtomicUsize::new(0),
             canceled: Arc::clone(&canceled),
+            cancel_delay: Duration::from_millis(10),
         });
         let (read, mut write, task) = spawn_worker(provider, tools(None)).await;
         let mut reader = BufReader::new(read);
@@ -1392,7 +1518,7 @@ mod tests {
             }
         });
         started.notified().await;
-        let (_agent_events_tx, agent_events) = mpsc::unbounded_channel();
+        let (_agent_events_tx, agent_events) = mpsc::channel(1);
         let turn = ActiveTurn {
             events: agent_events,
             handle,
@@ -1417,9 +1543,215 @@ mod tests {
         });
         approval_events_rx.recv().await.unwrap();
 
-        cancel_active_turn(turn, &approver).await;
+        cancel_active_turn(turn, &approver).await.unwrap();
 
         assert!(observed_rx.await.unwrap());
         approval.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_approval_handle_cannot_authorize_reused_provider_call_id() {
+        let (read, mut write, task) = spawn_worker(
+            Arc::new(ReusedProviderCallIdProvider),
+            tools(Some(Box::new(MutatingTool))),
+        )
+        .await;
+        let mut reader = BufReader::new(read);
+
+        write_frame(
+            &mut write,
+            &DaemonCommand::Input {
+                text: "generation-a".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let handle_a = loop {
+            if let WorkerEvent::NeedsApproval { call_id, .. } = next_event(&mut reader).await {
+                break call_id;
+            }
+        };
+        write_frame(&mut write, &DaemonCommand::Cancel)
+            .await
+            .unwrap();
+
+        write_frame(
+            &mut write,
+            &DaemonCommand::Input {
+                text: "generation-b".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let handle_b = loop {
+            if let WorkerEvent::NeedsApproval { call_id, .. } = next_event(&mut reader).await {
+                break call_id;
+            }
+        };
+        assert_ne!(handle_a, handle_b);
+
+        write_frame(
+            &mut write,
+            &DaemonCommand::Approve {
+                call_id: handle_a,
+                decision: IpcApprovalDecision::Allow,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(timeout(Duration::from_millis(50), async {
+            loop {
+                if matches!(
+                    next_event(&mut reader).await,
+                    WorkerEvent::ToolStart { .. } | WorkerEvent::ToolResult { .. }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_err());
+
+        write_frame(
+            &mut write,
+            &DaemonCommand::Approve {
+                call_id: handle_b.clone(),
+                decision: IpcApprovalDecision::Allow,
+            },
+        )
+        .await
+        .unwrap();
+        let mut saw_start = false;
+        let mut saw_result = false;
+        loop {
+            match next_event(&mut reader).await {
+                WorkerEvent::ToolStart { call_id, .. } => {
+                    assert_eq!(call_id, handle_b);
+                    saw_start = true;
+                }
+                WorkerEvent::ToolResult { call_id, .. } => {
+                    assert_eq!(call_id, handle_b);
+                    saw_result = true;
+                }
+                WorkerEvent::TurnFinished => break,
+                _ => {}
+            }
+        }
+        assert!(saw_start && saw_result);
+
+        write_frame(&mut write, &DaemonCommand::Stop).await.unwrap();
+        next_event(&mut reader).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn assistant_message_precedes_approval_and_tool_start_follows_decision() {
+        let provider = Arc::new(ApprovalProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (read, mut write, task) =
+            spawn_worker(provider, tools(Some(Box::new(MutatingTool)))).await;
+        let mut reader = BufReader::new(read);
+
+        write_frame(
+            &mut write,
+            &DaemonCommand::Input {
+                text: "ordered".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut kinds = Vec::new();
+        let approval_handle = loop {
+            match next_event(&mut reader).await {
+                WorkerEvent::AssistantMessage { .. } => kinds.push("assistant"),
+                WorkerEvent::NeedsApproval { call_id, .. } => {
+                    kinds.push("approval");
+                    break call_id;
+                }
+                WorkerEvent::ToolStart { .. } => panic!("tool started before approval decision"),
+                _ => {}
+            }
+        };
+        assert_eq!(kinds, ["assistant", "approval"]);
+
+        write_frame(
+            &mut write,
+            &DaemonCommand::Approve {
+                call_id: approval_handle.clone(),
+                decision: IpcApprovalDecision::Allow,
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            if let WorkerEvent::ToolStart { call_id, .. } = next_event(&mut reader).await {
+                assert_eq!(call_id, approval_handle);
+                break;
+            }
+        }
+
+        loop {
+            if matches!(next_event(&mut reader).await, WorkerEvent::TurnFinished) {
+                break;
+            }
+        }
+        write_frame(&mut write, &DaemonCommand::Stop).await.unwrap();
+        next_event(&mut reader).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_timeout_reports_crash_and_terminates_worker() {
+        let canceled = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(CancellationOrderProvider {
+            calls: AtomicUsize::new(0),
+            canceled,
+            cancel_delay: Duration::from_millis(500),
+        });
+        let (read, mut write, mut task) = spawn_worker(provider, tools(None)).await;
+        let mut reader = BufReader::new(read);
+
+        write_frame(
+            &mut write,
+            &DaemonCommand::Input {
+                text: "completed-turn".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            if matches!(next_event(&mut reader).await, WorkerEvent::TurnFinished) {
+                break;
+            }
+        }
+
+        write_frame(
+            &mut write,
+            &DaemonCommand::Input {
+                text: "blocking-cancel".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(next_event(&mut reader).await, WorkerEvent::TextDelta { text } if text == "partial")
+        );
+        write_frame(&mut write, &DaemonCommand::Cancel)
+            .await
+            .unwrap();
+
+        let event = timeout(Duration::from_millis(450), next_event(&mut reader))
+            .await
+            .expect("cancel timeout did not produce a bounded terminal event");
+        assert!(
+            matches!(event, WorkerEvent::Crash { message } if message.contains("cancellation cleanup deadline"))
+        );
+        let result = timeout(Duration::from_millis(450), &mut task)
+            .await
+            .expect("worker did not terminate after cancellation cleanup deadline")
+            .unwrap();
+        assert!(result.is_err());
     }
 }

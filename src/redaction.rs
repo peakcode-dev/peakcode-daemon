@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
-
 use crate::ipc::WorkerEvent;
 
 const REDACTED: &str = "[REDACTED]";
@@ -25,23 +22,10 @@ const TOKEN_PREFIXES: [&str; 8] = [
 /// Redacts configured credentials without exposing them through `Debug` or errors.
 pub(crate) struct Redactor {
     secrets: Vec<String>,
-    identifiers: Mutex<IdentifierState>,
-}
-
-#[derive(Default)]
-struct IdentifierState {
-    aliases: HashMap<String, String>,
-    next_alias: u64,
+    replacement: &'static str,
 }
 
 impl Redactor {
-    pub(crate) fn empty() -> Self {
-        Self {
-            secrets: Vec::new(),
-            identifiers: Mutex::new(IdentifierState::default()),
-        }
-    }
-
     pub(crate) fn from_env(provider_api_key: &str) -> Self {
         Self::from_named_values(provider_api_key, std::env::vars())
     }
@@ -58,13 +42,18 @@ impl Redactor {
         }
         secrets.extend(values.into_iter().filter_map(|(name, value)| {
             let value = value.as_ref();
-            (is_sensitive_name(name.as_ref()) && value.len() >= 4).then(|| value.to_owned())
+            (is_sensitive_name(name.as_ref()) && !value.is_empty()).then(|| value.to_owned())
         }));
         secrets.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
         secrets.dedup();
+        let replacement = if secrets.iter().any(|secret| REDACTED.contains(secret)) {
+            ""
+        } else {
+            REDACTED
+        };
         Self {
             secrets,
-            identifiers: Mutex::new(IdentifierState::default()),
+            replacement,
         }
     }
 
@@ -81,7 +70,7 @@ impl Redactor {
                 name,
                 arguments_json,
             } => WorkerEvent::ToolStart {
-                call_id: self.redact_identifier(&call_id),
+                call_id,
                 name: self.redact_text(&name),
                 arguments_json: self.redact_text(&arguments_json),
             },
@@ -91,7 +80,7 @@ impl Redactor {
                 content,
                 is_error,
             } => WorkerEvent::ToolResult {
-                call_id: self.redact_identifier(&call_id),
+                call_id,
                 name: self.redact_text(&name),
                 content: self.redact_text(&content),
                 is_error,
@@ -101,7 +90,7 @@ impl Redactor {
                 tool,
                 arguments_json,
             } => WorkerEvent::NeedsApproval {
-                call_id: self.redact_identifier(&call_id),
+                call_id,
                 tool: self.redact_text(&tool),
                 arguments_json: self.redact_text(&arguments_json),
             },
@@ -115,33 +104,14 @@ impl Redactor {
     pub(crate) fn redact_text(&self, input: &str) -> String {
         let mut redacted = input.to_owned();
         for secret in &self.secrets {
-            redacted = redacted.replace(secret, REDACTED);
+            redacted = redacted.replace(secret, self.replacement);
         }
-        redacted = redact_private_keys(redacted);
-        redacted = redact_bearer_tokens(redacted);
+        redacted = redact_private_keys(redacted, self.replacement);
+        redacted = redact_bearer_tokens(redacted, self.replacement);
         for prefix in TOKEN_PREFIXES {
-            redacted = redact_prefixed_tokens(redacted, prefix);
+            redacted = redact_prefixed_tokens(redacted, prefix, self.replacement);
         }
         redacted
-    }
-
-    pub(crate) fn redact_identifier(&self, input: &str) -> String {
-        let redacted = self.redact_text(input);
-        if redacted == input {
-            return redacted;
-        }
-
-        let mut identifiers = self
-            .identifiers
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(alias) = identifiers.aliases.get(input) {
-            return alias.clone();
-        }
-        let alias = format!("redacted-call-{}", identifiers.next_alias);
-        identifiers.next_alias = identifiers.next_alias.wrapping_add(1);
-        identifiers.aliases.insert(input.to_owned(), alias.clone());
-        alias
     }
 }
 
@@ -165,7 +135,7 @@ fn is_sensitive_name(name: &str) -> bool {
         || name.ends_with("_DSN")
 }
 
-fn redact_private_keys(mut text: String) -> String {
+fn redact_private_keys(mut text: String, replacement: &str) -> String {
     for label in PRIVATE_KEY_LABELS {
         let begin = format!("-----BEGIN {label}-----");
         let end = format!("-----END {label}-----");
@@ -174,13 +144,13 @@ fn redact_private_keys(mut text: String) -> String {
                 .find(&end)
                 .map(|offset| start + offset + end.len())
                 .unwrap_or(text.len());
-            text.replace_range(start..block_end, REDACTED);
+            text.replace_range(start..block_end, replacement);
         }
     }
     text
 }
 
-fn redact_bearer_tokens(mut text: String) -> String {
+fn redact_bearer_tokens(mut text: String, replacement: &str) -> String {
     let mut cursor = 0;
     loop {
         let lowercase = text.to_ascii_lowercase();
@@ -193,8 +163,8 @@ fn redact_bearer_tokens(mut text: String) -> String {
             .map(|offset| token_start + offset)
             .unwrap_or(text.len());
         if token_end > token_start {
-            text.replace_range(token_start..token_end, REDACTED);
-            cursor = token_start + REDACTED.len();
+            text.replace_range(token_start..token_end, replacement);
+            cursor = token_start + replacement.len();
         } else {
             cursor = token_start;
         }
@@ -202,7 +172,7 @@ fn redact_bearer_tokens(mut text: String) -> String {
     text
 }
 
-fn redact_prefixed_tokens(mut text: String, prefix: &str) -> String {
+fn redact_prefixed_tokens(mut text: String, prefix: &str, replacement: &str) -> String {
     let mut cursor = 0;
     while let Some(offset) = text[cursor..].find(prefix) {
         let start = cursor + offset;
@@ -215,8 +185,8 @@ fn redact_prefixed_tokens(mut text: String, prefix: &str) -> String {
             .map(|(offset, character)| start + offset + character.len_utf8())
             .unwrap_or(start);
         if end - start >= prefix.len() + 12 {
-            text.replace_range(start..end, REDACTED);
-            cursor = start + REDACTED.len();
+            text.replace_range(start..end, replacement);
+            cursor = start + replacement.len();
         } else {
             cursor = start + prefix.len();
         }
@@ -235,6 +205,9 @@ mod tests {
             "provider-secret",
             [
                 ("DATABASE_PASSWORD", "environment-secret"),
+                ("SHORT_TOKEN", "x"),
+                ("SHORT_PASSWORD", "p"),
+                ("ONE_CHARACTER_SECRET", "E"),
                 ("PATH", "not-sensitive"),
             ],
         );
@@ -243,16 +216,19 @@ mod tests {
         let github_token = "ghp_1234567890abcdefghijklmnop";
 
         let redacted = redactor.redact_text(&format!(
-            "provider-secret environment-secret not-sensitive {private_key} {bearer} {github_token}"
+            "provider-secret environment-secret x p not-sensitive {private_key} {bearer} {github_token}"
         ));
 
         assert!(!redacted.contains("provider-secret"));
         assert!(!redacted.contains("environment-secret"));
+        assert!(!redacted.contains(" x "));
+        assert!(!redacted.contains(" p "));
+        assert!(!redacted.contains('E'));
         assert!(!redacted.contains("private-body"));
         assert!(!redacted.contains("bearer-token-value"));
         assert!(!redacted.contains(github_token));
         assert!(redacted.contains("not-sensitive"));
-        assert!(redacted.contains("[REDACTED]"));
+        assert!(!redacted.contains("[REDACTED]"));
     }
 
     #[test]
@@ -266,18 +242,18 @@ mod tests {
                 text: "secret".to_owned(),
             },
             WorkerEvent::ToolStart {
-                call_id: "secret".to_owned(),
+                call_id: "call-safe".to_owned(),
                 name: "secret".to_owned(),
                 arguments_json: "secret".to_owned(),
             },
             WorkerEvent::ToolResult {
-                call_id: "secret".to_owned(),
+                call_id: "call-safe".to_owned(),
                 name: "secret".to_owned(),
                 content: "secret".to_owned(),
                 is_error: false,
             },
             WorkerEvent::NeedsApproval {
-                call_id: "secret".to_owned(),
+                call_id: "call-safe".to_owned(),
                 tool: "secret".to_owned(),
                 arguments_json: "secret".to_owned(),
             },
@@ -294,17 +270,18 @@ mod tests {
     }
 
     #[test]
-    fn secret_bearing_identifiers_get_stable_unique_aliases() {
+    fn redactor_does_not_rewrite_opaque_call_identity() {
         let redactor =
             Redactor::from_named_values("provider-secret", std::iter::empty::<(&str, &str)>());
+        let event = redactor.redact_event(WorkerEvent::ToolStart {
+            call_id: "redacted-call-0".to_owned(),
+            name: "tool".to_owned(),
+            arguments_json: "provider-secret".to_owned(),
+        });
 
-        let first = redactor.redact_identifier("call-provider-secret-first");
-        let repeated = redactor.redact_identifier("call-provider-secret-first");
-        let second = redactor.redact_identifier("call-provider-secret-second");
-
-        assert_eq!(first, repeated);
-        assert_ne!(first, second);
-        assert!(!first.contains("provider-secret"));
-        assert!(!second.contains("provider-secret"));
+        assert!(
+            matches!(event, WorkerEvent::ToolStart { call_id, arguments_json, .. }
+            if call_id == "redacted-call-0" && arguments_json == "[REDACTED]")
+        );
     }
 }

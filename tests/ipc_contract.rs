@@ -83,6 +83,13 @@ async fn oversized_write_returns_invalid_data() {
 }
 
 #[tokio::test]
+async fn max_sized_outbound_frame_is_accepted() {
+    let value = "x".repeat(MAX_IPC_FRAME_BYTES - 2);
+
+    write_frame(&mut tokio::io::sink(), &value).await.unwrap();
+}
+
+#[tokio::test]
 async fn missing_newline_before_eof_is_rejected() {
     let (mut writer, reader) = duplex(64);
     writer.write_all(br#"{"kind":"cancel"}"#).await.unwrap();

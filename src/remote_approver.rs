@@ -6,16 +6,22 @@ use async_trait::async_trait;
 use peakcode_core::{ApprovalDecision, ApprovalRequest, Approver};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::ipc::{IpcApprovalDecision, WorkerEvent};
-use crate::redaction::Redactor;
+use crate::call_id_mapper::CallIdMapper;
+use crate::ipc::IpcApprovalDecision;
 
 /// Routes core approval requests to the daemon and correlates typed replies.
 #[derive(Clone)]
 pub struct RemoteApprover {
     state: Arc<Mutex<ApprovalState>>,
     next_token: Arc<AtomicU64>,
-    events: mpsc::Sender<WorkerEvent>,
-    redactor: Arc<Redactor>,
+    approvals: mpsc::Sender<ApprovalNotice>,
+    call_ids: Arc<CallIdMapper>,
+}
+
+pub(crate) struct ApprovalNotice {
+    pub(crate) call_id: String,
+    pub(crate) tool: String,
+    pub(crate) arguments_json: String,
 }
 
 #[derive(Default)]
@@ -50,19 +56,20 @@ impl Drop for PendingRegistration {
 }
 
 impl RemoteApprover {
-    pub fn new(events: mpsc::Sender<WorkerEvent>) -> Self {
-        Self::with_redactor(events, Arc::new(Redactor::empty()))
+    #[cfg(test)]
+    pub(crate) fn new(approvals: mpsc::Sender<ApprovalNotice>) -> Self {
+        Self::with_call_ids(approvals, Arc::new(CallIdMapper::default()))
     }
 
-    pub(crate) fn with_redactor(
-        events: mpsc::Sender<WorkerEvent>,
-        redactor: Arc<Redactor>,
+    pub(crate) fn with_call_ids(
+        approvals: mpsc::Sender<ApprovalNotice>,
+        call_ids: Arc<CallIdMapper>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(ApprovalState::default())),
             next_token: Arc::new(AtomicU64::new(0)),
-            events,
-            redactor,
+            approvals,
+            call_ids,
         }
     }
 
@@ -94,12 +101,15 @@ impl Approver for RemoteApprover {
     async fn approve(&self, request: ApprovalRequest) -> ApprovalDecision {
         let (response_tx, response_rx) = oneshot::channel();
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
-        let call_id = self.redactor.redact_identifier(&request.call_id);
         {
-            let mut state = lock_state(&self.state);
+            let state = lock_state(&self.state);
             if state.allowed_tools.contains(&request.tool) {
                 return ApprovalDecision::AllowAll;
             }
+        }
+        let call_id = self.call_ids.start_approval(&request.call_id);
+        {
+            let mut state = lock_state(&self.state);
             match state.pending.entry(call_id.clone()) {
                 Entry::Vacant(entry) => {
                     entry.insert(PendingApproval {
@@ -117,12 +127,12 @@ impl Approver for RemoteApprover {
             state: Arc::clone(&self.state),
         };
 
-        let event = WorkerEvent::NeedsApproval {
+        let notice = ApprovalNotice {
             call_id,
             tool: request.tool,
             arguments_json: request.arguments.to_string(),
         };
-        if self.events.send(event).await.is_err() {
+        if self.approvals.send(notice).await.is_err() {
             return ApprovalDecision::Deny;
         }
 
@@ -146,6 +156,7 @@ fn map_decision(decision: IpcApprovalDecision) -> ApprovalDecision {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
 
     use peakcode_core::{ApprovalDecision, ApprovalRequest, Approver};
@@ -153,8 +164,8 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::timeout;
 
-    use super::RemoteApprover;
-    use crate::ipc::{IpcApprovalDecision, WorkerEvent};
+    use super::{ApprovalNotice, RemoteApprover};
+    use crate::ipc::IpcApprovalDecision;
 
     fn request_for(tool: &str, call_id: &str) -> ApprovalRequest {
         ApprovalRequest {
@@ -177,17 +188,17 @@ mod tests {
             async move { approver.approve(request("call-1")).await }
         });
 
-        assert_eq!(
-            events_rx.recv().await,
-            Some(WorkerEvent::NeedsApproval {
-                call_id: "call-1".to_owned(),
-                tool: "bash".to_owned(),
-                arguments_json: r#"{"command":"pwd"}"#.to_owned(),
-            })
-        );
+        let ApprovalNotice {
+            call_id: handle,
+            tool,
+            arguments_json,
+        } = events_rx.recv().await.unwrap();
+        assert_eq!(tool, "bash");
+        assert_eq!(arguments_json, r#"{"command":"pwd"}"#);
+        assert_ne!(handle, "call-1");
         assert!(
             approver
-                .resolve("call-1", IpcApprovalDecision::AllowAll)
+                .resolve(&handle, IpcApprovalDecision::AllowAll)
                 .await
         );
         assert_eq!(pending.await.unwrap(), ApprovalDecision::AllowAll);
@@ -201,15 +212,15 @@ mod tests {
             let approver = approver.clone();
             async move { approver.approve(request("known")).await }
         });
-        events_rx.recv().await.unwrap();
+        let handle = events_rx.recv().await.unwrap().call_id;
 
         assert!(
             !approver
                 .resolve("unknown", IpcApprovalDecision::Allow)
                 .await
         );
-        assert!(approver.resolve("known", IpcApprovalDecision::Deny).await);
-        assert!(!approver.resolve("known", IpcApprovalDecision::Allow).await);
+        assert!(approver.resolve(&handle, IpcApprovalDecision::Deny).await);
+        assert!(!approver.resolve(&handle, IpcApprovalDecision::Allow).await);
         assert_eq!(pending.await.unwrap(), ApprovalDecision::Deny);
     }
 
@@ -219,51 +230,61 @@ mod tests {
         let approver = RemoteApprover::new(events_tx);
         let first = tokio::spawn({
             let approver = approver.clone();
-            async move { approver.approve(request("first")).await }
+            async move { approver.approve(request_for("first-tool", "first")).await }
         });
         let second = tokio::spawn({
             let approver = approver.clone();
-            async move { approver.approve(request("second")).await }
+            async move { approver.approve(request_for("second-tool", "second")).await }
         });
 
-        let mut ids = vec![
-            match events_rx.recv().await.unwrap() {
-                WorkerEvent::NeedsApproval { call_id, .. } => call_id,
-                event => panic!("unexpected event: {event:?}"),
-            },
-            match events_rx.recv().await.unwrap() {
-                WorkerEvent::NeedsApproval { call_id, .. } => call_id,
-                event => panic!("unexpected event: {event:?}"),
-            },
-        ];
-        ids.sort();
-        assert_eq!(ids, ["first", "second"]);
+        let mut handles = HashMap::new();
+        for _ in 0..2 {
+            let notice = events_rx.recv().await.unwrap();
+            handles.insert(notice.tool, notice.call_id);
+        }
 
-        assert!(approver.resolve("second", IpcApprovalDecision::Deny).await);
-        assert!(approver.resolve("first", IpcApprovalDecision::Allow).await);
+        assert!(
+            approver
+                .resolve(&handles["second-tool"], IpcApprovalDecision::Deny)
+                .await
+        );
+        assert!(
+            approver
+                .resolve(&handles["first-tool"], IpcApprovalDecision::Allow)
+                .await
+        );
         assert_eq!(first.await.unwrap(), ApprovalDecision::Allow);
         assert_eq!(second.await.unwrap(), ApprovalDecision::Deny);
     }
 
     #[tokio::test]
-    async fn duplicate_pending_call_id_is_denied_without_replacing_waiter() {
+    async fn repeated_provider_call_ids_receive_distinct_pending_handles() {
         let (events_tx, mut events_rx) = mpsc::channel(4);
         let approver = RemoteApprover::new(events_tx);
         let first = tokio::spawn({
             let approver = approver.clone();
             async move { approver.approve(request("same")).await }
         });
-        events_rx.recv().await.unwrap();
+        let first_handle = events_rx.recv().await.unwrap().call_id;
+        let second = tokio::spawn({
+            let approver = approver.clone();
+            async move { approver.approve(request("same")).await }
+        });
+        let second_handle = events_rx.recv().await.unwrap().call_id;
 
-        assert_eq!(
-            approver.approve(request("same")).await,
-            ApprovalDecision::Deny
+        assert_ne!(first_handle, second_handle);
+        assert!(
+            approver
+                .resolve(&second_handle, IpcApprovalDecision::Deny)
+                .await
         );
-        assert!(timeout(Duration::from_millis(20), events_rx.recv())
-            .await
-            .is_err());
-        assert!(approver.resolve("same", IpcApprovalDecision::Allow).await);
+        assert!(
+            approver
+                .resolve(&first_handle, IpcApprovalDecision::Allow)
+                .await
+        );
         assert_eq!(first.await.unwrap(), ApprovalDecision::Allow);
+        assert_eq!(second.await.unwrap(), ApprovalDecision::Deny);
     }
 
     #[tokio::test]
@@ -315,8 +336,8 @@ mod tests {
             .await
             .expect("reused call_id did not emit a new approval event")
             .unwrap();
-        assert!(matches!(event, WorkerEvent::NeedsApproval { call_id, .. } if call_id == "reused"));
-        assert!(approver.resolve("reused", IpcApprovalDecision::Allow).await);
+        let handle = event.call_id;
+        assert!(approver.resolve(&handle, IpcApprovalDecision::Allow).await);
         assert_eq!(second.await.unwrap(), ApprovalDecision::Allow);
     }
 
@@ -328,10 +349,10 @@ mod tests {
             let approver = approver.clone();
             async move { approver.approve(request_for("bash", "first")).await }
         });
-        events_rx.recv().await.unwrap();
+        let first_handle = events_rx.recv().await.unwrap().call_id;
         assert!(
             approver
-                .resolve("first", IpcApprovalDecision::AllowAll)
+                .resolve(&first_handle, IpcApprovalDecision::AllowAll)
                 .await
         );
         assert_eq!(first.await.unwrap(), ApprovalDecision::AllowAll);
@@ -353,10 +374,14 @@ mod tests {
             let approver = approver.clone();
             async move { approver.approve(request_for("edit", "third")).await }
         });
+        let other_notice = events_rx.recv().await.unwrap();
+        assert_eq!(other_notice.tool, "edit");
+        let other_handle = other_notice.call_id;
         assert!(
-            matches!(events_rx.recv().await, Some(WorkerEvent::NeedsApproval { call_id, tool, .. }) if call_id == "third" && tool == "edit")
+            approver
+                .resolve(&other_handle, IpcApprovalDecision::Deny)
+                .await
         );
-        assert!(approver.resolve("third", IpcApprovalDecision::Deny).await);
         assert_eq!(other.await.unwrap(), ApprovalDecision::Deny);
     }
 }

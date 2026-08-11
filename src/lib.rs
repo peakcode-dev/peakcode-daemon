@@ -1,4 +1,5 @@
 //! peakcode-daemon library: typed protocol and daemon components.
+mod call_id_mapper;
 pub mod ipc;
 pub mod proto;
 mod redaction;
