@@ -27,9 +27,14 @@ The protocol uses newline-delimited JSON (NDJSON):
 - peakcode-core and its OpenAI provider each bound their event channels at 64 entries. The worker's
   core-event receiver is therefore bounded end to end; no unbounded event queue sits behind the
   worker writer.
-- `stop` allows up to 250 ms to enqueue `done`. Final reader, active-turn, and writer cleanup each
-  use a 250 ms deadline. If the peer does not drain output, `done` is best-effort and the blocked
-  writer task is aborted after its deadline so the worker can exit.
+- During cancel, normal stop, or queue-overflow termination, an ordinary event already held by the
+  coordinator remains ahead of later turn or terminal events. While idle with such an event, the
+  coordinator selects between command handling and writer capacity, so `stop` remains responsive.
+- Normal stop and queue-overflow termination use one 250 ms enqueue deadline for the held ordinary
+  event, if any, followed by `done` or `crash`. Final reader, active-turn, and writer cleanup each use
+  a 250 ms deadline. A draining peer therefore observes the ordinary event before the terminal
+  event. If the peer is undrained or broken when a deadline expires, bounded worker termination
+  takes priority and any frame not fully written by then may be lost.
 - Outbound JSON is serialized directly into a capped buffer. The buffer rejects a write before it
   would grow beyond 1 MiB; the line-feed byte is written separately only after successful
   serialization, so an exact-max payload does not grow the payload allocation.
@@ -68,7 +73,7 @@ when they need structured tool arguments.
 | --- | --- |
 | `allow` | Allows the tool call identified by `call_id`. |
 | `deny` | Denies the tool call identified by `call_id`. |
-| `allow_all` | Allows the identified call and subsequent approval-requiring calls for the session. |
+| `allow_all` | Allows the identified call and subsequent calls to the same registered tool for this worker session. |
 
 ## Input flow
 
@@ -117,9 +122,12 @@ same handle as that invocation's `needs_approval`. Calls that do not require app
 opaque handle on `tool_start`. The mapping is removed on `tool_result` and cleared on cancel or turn
 termination, bounding its lifetime.
 
-An `allow_all` decision is retained by the worker approval adapter for the rest of that worker
-session. Later turns can run the same tool without another `needs_approval`; unrelated tools still
-require their own decision.
+At worker construction, the approval adapter derives an immutable finite set of registered tool
+names from the tool registry schemas. An `allow_all` decision is retained for the rest of the worker
+session only when its tool is in that set. Later turns can run that registered tool without another
+`needs_approval`; unrelated registered tools still require their own decision. For an unknown tool,
+`allow_all` acts as ordinary `allow` for only that invocation and creates no session state. The
+persistent approved set is therefore always a subset of the finite worker tool registry.
 
 All worker events, including approval requests and forwarded peakcode-core events, pass through one
 bounded channel and one writer task. Only that task writes NDJSON bytes to the socket, preventing
@@ -134,6 +142,12 @@ remains available for later input. If cleanup exceeds the deadline, the worker e
 terminal `crash` best-effort and ends the session rather than accepting another turn. If no turn is
 active, cancellation is a safe no-op.
 
+An ordinary core event already received by the coordinator is not part of the canceled turn's
+mutable history: the worker retains and flushes that event through the single writer before starting
+another turn. A pending approval barrier, a held `needs_approval`, and queued internal approval
+notices may instead be discarded on `cancel` or `stop`, because cancellation invalidates their
+authorization handles and waiters. This exception does not permit discarding an ordinary held event.
+
 On supported Unix platforms, peakcode-core starts each bash tool in its own process group; aborting
 the agent drops the managed child and sends `SIGKILL` to the shell leader and descendants that remain
 in that group. A child that deliberately escapes with `setsid` or `setpgid` is outside this Task 4
@@ -141,8 +155,10 @@ guarantee. Linux cgroup containment for deliberate escapes belongs to supervisor
 implemented by the worker.
 
 `stop` ends the session permanently. The worker must stop accepting input, perform bounded cleanup,
-emit `done` with the final in-memory message count, and exit. A frontend detach is neither `cancel`
-nor `stop`; disconnecting a frontend must not change the worker lifetime.
+enqueue an ordinary coordinator-held event before `done`, and exit. The ordering guarantee applies
+while the peer drains output; an undrained or broken peer may lose unsent frames when the fixed
+deadline expires. A frontend detach is neither `cancel` nor `stop`; disconnecting a frontend must
+not change the worker lifetime.
 
 ## Compatibility and safety
 

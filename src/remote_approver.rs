@@ -13,6 +13,7 @@ use crate::ipc::IpcApprovalDecision;
 #[derive(Clone)]
 pub struct RemoteApprover {
     state: Arc<Mutex<ApprovalState>>,
+    registered_tools: Arc<HashSet<String>>,
     next_token: Arc<AtomicU64>,
     approvals: mpsc::Sender<ApprovalNotice>,
     call_ids: Arc<CallIdMapper>,
@@ -58,15 +59,28 @@ impl Drop for PendingRegistration {
 impl RemoteApprover {
     #[cfg(test)]
     pub(crate) fn new(approvals: mpsc::Sender<ApprovalNotice>) -> Self {
-        Self::with_call_ids(approvals, Arc::new(CallIdMapper::default()))
+        Self {
+            state: Arc::new(Mutex::new(ApprovalState::default())),
+            registered_tools: Arc::new(["bash", "edit"].into_iter().map(str::to_owned).collect()),
+            next_token: Arc::new(AtomicU64::new(0)),
+            approvals,
+            call_ids: Arc::new(CallIdMapper::default()),
+        }
     }
 
     pub(crate) fn with_call_ids(
         approvals: mpsc::Sender<ApprovalNotice>,
         call_ids: Arc<CallIdMapper>,
+        tools: &peakcode_core::ToolRegistry,
     ) -> Self {
+        let registered_tools = tools
+            .schemas()
+            .into_iter()
+            .map(|schema| schema.name)
+            .collect();
         Self {
             state: Arc::new(Mutex::new(ApprovalState::default())),
+            registered_tools: Arc::new(registered_tools),
             next_token: Arc::new(AtomicU64::new(0)),
             approvals,
             call_ids,
@@ -80,11 +94,15 @@ impl RemoteApprover {
             return false;
         };
         let tool = approval.tool.clone();
-        let sent = approval
-            .response
-            .send(map_decision(decision.clone()))
-            .is_ok();
-        if sent && decision == IpcApprovalDecision::AllowAll {
+        let persist =
+            decision == IpcApprovalDecision::AllowAll && self.registered_tools.contains(&tool);
+        let core_decision = if decision == IpcApprovalDecision::AllowAll && !persist {
+            ApprovalDecision::Allow
+        } else {
+            map_decision(decision)
+        };
+        let sent = approval.response.send(core_decision).is_ok();
+        if sent && persist {
             state.allowed_tools.insert(tool);
         }
         sent
@@ -383,5 +401,44 @@ mod tests {
                 .await
         );
         assert_eq!(other.await.unwrap(), ApprovalDecision::Deny);
+    }
+
+    #[tokio::test]
+    async fn allow_all_does_not_persist_for_many_unknown_tool_names() {
+        let (events_tx, mut events_rx) = mpsc::channel(4);
+        let approver = RemoteApprover::new(events_tx);
+
+        for index in 0..128 {
+            let tool = format!("unknown-{index}");
+            let first = tokio::spawn({
+                let approver = approver.clone();
+                let tool = tool.clone();
+                async move { approver.approve(request_for(&tool, "first")).await }
+            });
+            let first_handle = events_rx.recv().await.unwrap().call_id;
+            assert!(
+                approver
+                    .resolve(&first_handle, IpcApprovalDecision::AllowAll)
+                    .await
+            );
+            assert_eq!(first.await.unwrap(), ApprovalDecision::Allow);
+
+            let repeated = tokio::spawn({
+                let approver = approver.clone();
+                let tool = tool.clone();
+                async move { approver.approve(request_for(&tool, "repeated")).await }
+            });
+            let repeated_notice = timeout(Duration::from_millis(100), events_rx.recv())
+                .await
+                .expect("unknown tool AllowAll persisted")
+                .unwrap();
+            assert_eq!(repeated_notice.tool, tool);
+            assert!(
+                approver
+                    .resolve(&repeated_notice.call_id, IpcApprovalDecision::Deny)
+                    .await
+            );
+            assert_eq!(repeated.await.unwrap(), ApprovalDecision::Deny);
+        }
     }
 }

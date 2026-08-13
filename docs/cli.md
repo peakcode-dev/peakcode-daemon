@@ -27,13 +27,20 @@ error best-effort and ends the session instead of accepting another input.
 
 Worker output is bounded and centrally redacted before serialization. If the daemon stops draining
 events, `stop` uses 250 ms deadlines for final event delivery and writer cleanup, then aborts the
-blocked writer. The reader-to-coordinator transport channel holds at most 64 commands, and the
-coordinator separately retains at most 32 inputs behind an active turn. A 33rd input received by the
-coordinator reports a sanitized terminal error instead of being dropped or retained without bound.
+blocked writer. An ordinary event already held by the coordinator is kept across cancel and is
+enqueued before `done` or a queue-overflow error. A draining peer observes that order. Only an
+undrained or broken peer may lose unsent frames when the deadline expires and bounded termination
+takes priority. Pending approval barriers and notices may be discarded by cancel or stop because
+their authorization waiters are invalidated. The reader-to-coordinator transport channel holds at
+most 64 commands, and the coordinator separately retains at most 32 inputs behind an active turn. A
+33rd input received by the coordinator reports a sanitized terminal error instead of being dropped
+or retained without bound.
 
 Provider tool-call IDs never cross IPC. The worker assigns fresh opaque UUID-derived handles for
 approval and tool-event correlation, and orders each assistant message before its corresponding
-approval request.
+approval request even under writer backpressure. Session-wide `allow_all` applies only to subsequent
+calls to the same registered tool. Unknown model-generated tool names can be allowed for one
+invocation but cannot create persistent approval state.
 
 Worker mode is implemented. Daemon supervision, daemonization, and lifecycle modes remain
 command-surface stubs in pre-alpha and currently identify the selected mode before exiting

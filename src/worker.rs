@@ -103,6 +103,7 @@ async fn run_connection(
     let approver = Arc::new(RemoteApprover::with_call_ids(
         approval_tx,
         Arc::clone(&call_ids),
+        &tools,
     ));
     let mut active: Option<ActiveTurn> = None;
     let mut queued_inputs = VecDeque::new();
@@ -111,6 +112,58 @@ async fn run_connection(
 
     let result = 'worker: loop {
         if active.is_none() {
+            if pending_event.is_some() {
+                tokio::select! {
+                    command = command_rx.recv() => {
+                        match command {
+                            Some(Ok(DaemonCommand::Input { text })) => {
+                                if queued_inputs.len() == MAX_QUEUED_INPUTS {
+                                    let error = anyhow!(
+                                        "worker input queue limit exceeded (maximum {MAX_QUEUED_INPUTS})"
+                                    );
+                                    send_ordered_terminal_event(
+                                        &event_tx,
+                                        pending_event.take(),
+                                        WorkerEvent::Crash {
+                                            message: error.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    break 'worker Err(error);
+                                }
+                                queued_inputs.push_back(text);
+                            }
+                            Some(Ok(DaemonCommand::Approve { call_id, decision })) => {
+                                if !approver.resolve(&call_id, decision).await {
+                                    tracing::warn!("approval did not match a pending request");
+                                }
+                            }
+                            Some(Ok(DaemonCommand::Cancel)) => {}
+                            Some(Ok(DaemonCommand::Stop)) => {
+                                send_ordered_terminal_event(
+                                    &event_tx,
+                                    pending_event.take(),
+                                    done_event(messages.len()),
+                                )
+                                .await;
+                                break 'worker Ok(());
+                            }
+                            Some(Err(error)) => break 'worker Err(error.into()),
+                            None => break 'worker Ok(()),
+                        }
+                    }
+                    permit = event_tx.reserve() => {
+                        match permit {
+                            Ok(permit) => permit.send(
+                                pending_event.take().expect("pending event was checked")
+                            ),
+                            Err(_) => break 'worker Err(anyhow!("worker event writer closed")),
+                        }
+                    }
+                }
+                continue;
+            }
+
             if let Some(text) = queued_inputs.pop_front() {
                 active = Some(
                     start_turn(
@@ -137,7 +190,7 @@ async fn run_connection(
                     }
                     DaemonCommand::Cancel => {}
                     DaemonCommand::Stop => {
-                        send_done(&event_tx, messages.len()).await;
+                        send_terminal_event(&event_tx, done_event(messages.len())).await;
                         break 'worker Ok(());
                     }
                 },
@@ -177,8 +230,9 @@ async fn run_connection(
                             let error = anyhow!(
                                 "worker input queue limit exceeded (maximum {MAX_QUEUED_INPUTS})"
                             );
-                            send_terminal_event(
+                            send_ordered_terminal_event(
                                 &event_tx,
+                                pending_event.take(),
                                 WorkerEvent::Crash {
                                     message: error.to_string(),
                                 },
@@ -203,10 +257,13 @@ async fn run_connection(
                         call_ids.clear();
                         approval_barrier = None;
                         drain_approval_notices(&mut approval_rx);
-                        pending_event = None;
+                        if matches!(pending_event, Some(WorkerEvent::NeedsApproval { .. })) {
+                            pending_event = None;
+                        }
                         if let Err(error) = cancellation {
-                            send_terminal_event(
+                            send_ordered_terminal_event(
                                 &event_tx,
+                                pending_event.take(),
                                 WorkerEvent::Crash {
                                     message: error.to_string(),
                                 },
@@ -222,7 +279,15 @@ async fn run_connection(
                         approver.cancel_pending().await;
                         call_ids.clear();
                         drain_approval_notices(&mut approval_rx);
-                        send_done(&event_tx, messages.len()).await;
+                        if matches!(pending_event, Some(WorkerEvent::NeedsApproval { .. })) {
+                            pending_event = None;
+                        }
+                        send_ordered_terminal_event(
+                            &event_tx,
+                            pending_event.take(),
+                            done_event(messages.len()),
+                        )
+                        .await;
                         break 'worker Ok(());
                     }
                     Some(Err(error)) => break 'worker Err(error.into()),
@@ -295,18 +360,28 @@ async fn run_connection(
     Ok(())
 }
 
-async fn send_done(events: &mpsc::Sender<WorkerEvent>, final_message_count: usize) {
-    send_terminal_event(
-        events,
-        WorkerEvent::Done {
-            final_message_count,
-        },
-    )
-    .await;
+fn done_event(final_message_count: usize) -> WorkerEvent {
+    WorkerEvent::Done {
+        final_message_count,
+    }
 }
 
 async fn send_terminal_event(events: &mpsc::Sender<WorkerEvent>, event: WorkerEvent) {
     let _ = timeout(WORKER_SHUTDOWN_TIMEOUT, events.send(event)).await;
+}
+
+async fn send_ordered_terminal_event(
+    events: &mpsc::Sender<WorkerEvent>,
+    pending_event: Option<WorkerEvent>,
+    terminal_event: WorkerEvent,
+) {
+    let _ = timeout(WORKER_SHUTDOWN_TIMEOUT, async {
+        if let Some(event) = pending_event {
+            events.send(event).await?;
+        }
+        events.send(terminal_event).await
+    })
+    .await;
 }
 
 async fn abort_turn(mut turn: ActiveTurn) {
@@ -554,14 +629,29 @@ mod tests {
         }
     }
 
-    struct FloodProvider {
-        flooded: Arc<tokio::sync::Notify>,
+    struct HeldEventProvider {
+        calls: AtomicUsize,
     }
 
+    struct BackpressureTool {
+        executed: Arc<AtomicUsize>,
+        held: Arc<tokio::sync::Notify>,
+    }
+
+    struct NonApprovalProvider {
+        calls: AtomicUsize,
+    }
+
+    struct BackpressuredApprovalProvider {
+        calls: AtomicUsize,
+    }
+
+    struct NonApprovalTool;
+
     #[async_trait]
-    impl Provider for FloodProvider {
+    impl Provider for NonApprovalProvider {
         fn name(&self) -> &str {
-            "flood"
+            "nonapproval"
         }
 
         async fn stream(
@@ -570,17 +660,165 @@ mod tests {
             _tools: &[peakcode_core::ToolSchema],
             _config: &ProviderConfig,
         ) -> Result<ProviderStream, ProviderError> {
-            let (tx, rx) = mpsc::unbounded_channel();
-            let flooded = Arc::clone(&self.flooded);
-            tokio::spawn(async move {
-                let payload = "x".repeat(256 * 1024);
-                for _ in 0..96 {
-                    let _ = tx.send(Ok(ProviderEvent::TextDelta(payload.clone())));
-                }
-                flooded.notify_one();
-                tokio::time::sleep(Duration::from_secs(30)).await;
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(stream(vec![
+                    ProviderEvent::ToolCallStart {
+                        id: "raw-provider-id".to_owned(),
+                        name: "inspect".to_owned(),
+                    },
+                    ProviderEvent::ToolCallArgsDelta {
+                        id: "raw-provider-id".to_owned(),
+                        delta: "{}".to_owned(),
+                    },
+                    ProviderEvent::Finish {
+                        reason: FinishReason::ToolUse,
+                    },
+                ]))
+            } else {
+                Ok(stream(vec![ProviderEvent::Finish {
+                    reason: FinishReason::Stop,
+                }]))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for BackpressuredApprovalProvider {
+        fn name(&self) -> &str {
+            "backpressured-approval"
+        }
+
+        async fn stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[peakcode_core::ToolSchema],
+            _config: &ProviderConfig,
+        ) -> Result<ProviderStream, ProviderError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                return Ok(stream(vec![ProviderEvent::Finish {
+                    reason: FinishReason::Stop,
+                }]));
+            }
+
+            let mut events = Vec::with_capacity(257);
+            for index in 0..128 {
+                let call_id = format!("pressure-{index}");
+                events.push(ProviderEvent::ToolCallStart {
+                    id: call_id.clone(),
+                    name: if index == 127 {
+                        "mutate".to_owned()
+                    } else {
+                        "backpressure".to_owned()
+                    },
+                });
+                events.push(ProviderEvent::ToolCallArgsDelta {
+                    id: call_id,
+                    delta: json!({"index": index}).to_string(),
+                });
+            }
+            events.push(ProviderEvent::Finish {
+                reason: FinishReason::ToolUse,
             });
-            Ok(Box::pin(UnboundedReceiverStream::new(rx)))
+            Ok(stream(events))
+        }
+    }
+
+    #[async_trait]
+    impl Tool for NonApprovalTool {
+        fn name(&self) -> &str {
+            "inspect"
+        }
+
+        fn description(&self) -> &str {
+            "does not require approval"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        fn requires_approval(&self) -> Approval {
+            Approval::None
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> anyhow::Result<ToolOutput> {
+            Ok(ToolOutput::ok("inspected"))
+        }
+    }
+
+    #[async_trait]
+    impl Provider for HeldEventProvider {
+        fn name(&self) -> &str {
+            "held-event"
+        }
+
+        async fn stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[peakcode_core::ToolSchema],
+            _config: &ProviderConfig,
+        ) -> Result<ProviderStream, ProviderError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) != 0 {
+                return Ok(stream(vec![
+                    ProviderEvent::TextDelta("next-turn".to_owned()),
+                    ProviderEvent::Finish {
+                        reason: FinishReason::Stop,
+                    },
+                ]));
+            }
+
+            let mut events = Vec::with_capacity(257);
+            for index in 0..128 {
+                let call_id = format!("held-{index}");
+                events.push(ProviderEvent::ToolCallStart {
+                    id: call_id.clone(),
+                    name: "backpressure".to_owned(),
+                });
+                events.push(ProviderEvent::ToolCallArgsDelta {
+                    id: call_id,
+                    delta: json!({"index": index}).to_string(),
+                });
+            }
+            events.push(ProviderEvent::Finish {
+                reason: FinishReason::ToolUse,
+            });
+            Ok(stream(events))
+        }
+    }
+
+    #[async_trait]
+    impl Tool for BackpressureTool {
+        fn name(&self) -> &str {
+            "backpressure"
+        }
+
+        fn description(&self) -> &str {
+            "fills the worker event writer"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        fn requires_approval(&self) -> Approval {
+            Approval::None
+        }
+
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> anyhow::Result<ToolOutput> {
+            let index = params["index"].as_u64().unwrap();
+            let count = self.executed.fetch_add(1, Ordering::SeqCst) + 1;
+            if count == 34 {
+                self.held.notify_one();
+            }
+            Ok(ToolOutput::ok(format!("{index}:{}", "x".repeat(16 * 1024))))
         }
     }
 
@@ -985,6 +1223,148 @@ mod tests {
         (line, event)
     }
 
+    async fn spawn_worker_with_held_event() -> (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let held = Arc::new(tokio::sync::Notify::new());
+        let executed = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(HeldEventProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let tool = BackpressureTool {
+            executed: Arc::clone(&executed),
+            held: Arc::clone(&held),
+        };
+        let (read, mut write, task) = spawn_worker(provider, tools(Some(Box::new(tool)))).await;
+        write_frame(
+            &mut write,
+            &DaemonCommand::Input {
+                text: "fill-output".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), held.notified())
+            .await
+            .expect("coordinator did not reach a held ordinary event");
+        assert!(executed.load(Ordering::SeqCst) >= 34);
+        (read, write, task)
+    }
+
+    fn is_held_tool_start(event: &WorkerEvent) -> bool {
+        matches!(
+            event,
+            WorkerEvent::ToolStart { arguments_json, .. }
+                if serde_json::from_str::<serde_json::Value>(arguments_json).unwrap()["index"] == 33
+        )
+    }
+
+    #[tokio::test]
+    async fn cancel_preserves_held_event_before_accepting_next_turn() {
+        let (read, mut write, task) = spawn_worker_with_held_event().await;
+
+        write_frame(&mut write, &DaemonCommand::Cancel)
+            .await
+            .unwrap();
+        write_frame(
+            &mut write,
+            &DaemonCommand::Input {
+                text: "after-cancel".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut reader = BufReader::new(read);
+        let mut saw_held = false;
+        loop {
+            let event = next_event(&mut reader).await;
+            if is_held_tool_start(&event) {
+                saw_held = true;
+            }
+            if matches!(event, WorkerEvent::TextDelta { ref text } if text == "next-turn") {
+                assert!(saw_held, "next turn overtook the coordinator-held event");
+                break;
+            }
+        }
+
+        loop {
+            if matches!(next_event(&mut reader).await, WorkerEvent::TurnFinished) {
+                break;
+            }
+        }
+        write_frame(&mut write, &DaemonCommand::Stop).await.unwrap();
+        next_event(&mut reader).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_orders_held_event_before_done_when_peer_drains() {
+        let (read, mut write, task) = spawn_worker_with_held_event().await;
+        let reader = tokio::spawn(async move {
+            let mut reader = BufReader::new(read);
+            let mut saw_held = false;
+            loop {
+                let event = next_event(&mut reader).await;
+                if is_held_tool_start(&event) {
+                    saw_held = true;
+                }
+                if matches!(event, WorkerEvent::Done { .. }) {
+                    assert!(saw_held, "done overtook the coordinator-held event");
+                    break;
+                }
+            }
+        });
+
+        write_frame(&mut write, &DaemonCommand::Stop).await.unwrap();
+        reader.await.unwrap();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn overflow_orders_held_event_before_crash_when_peer_drains() {
+        let (read, mut write, mut task) = spawn_worker_with_held_event().await;
+        let (draining_tx, draining_rx) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            let mut reader = BufReader::new(read);
+            let mut saw_held = false;
+            let mut draining_tx = Some(draining_tx);
+            loop {
+                let event = next_event(&mut reader).await;
+                if let Some(draining_tx) = draining_tx.take() {
+                    let _ = draining_tx.send(());
+                }
+                if is_held_tool_start(&event) {
+                    saw_held = true;
+                }
+                if matches!(event, WorkerEvent::Crash { .. }) {
+                    assert!(saw_held, "crash overtook the coordinator-held event");
+                    break;
+                }
+            }
+        });
+        draining_rx.await.unwrap();
+
+        for index in 0..=super::MAX_QUEUED_INPUTS {
+            write_frame(
+                &mut write,
+                &DaemonCommand::Input {
+                    text: format!("queued-{index}"),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        reader.await.unwrap();
+        let result = timeout(Duration::from_secs(1), &mut task)
+            .await
+            .expect("worker did not terminate after overflow")
+            .unwrap();
+        assert!(result.is_err());
+    }
+
     #[tokio::test]
     async fn input_streams_events_across_turns_until_stop() {
         let (read, mut write, task) = spawn_worker(Arc::new(StopProvider), tools(None)).await;
@@ -1097,6 +1477,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nonapproval_tool_events_share_one_opaque_handle() {
+        let provider = Arc::new(NonApprovalProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (read, mut write, task) =
+            spawn_worker(provider, tools(Some(Box::new(NonApprovalTool)))).await;
+        let mut reader = BufReader::new(read);
+        write_frame(
+            &mut write,
+            &DaemonCommand::Input {
+                text: "inspect".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut start_handle = None;
+        let mut result_handle = None;
+        loop {
+            match next_event(&mut reader).await {
+                WorkerEvent::NeedsApproval { .. } => {
+                    panic!("nonapproval tool emitted an approval request")
+                }
+                WorkerEvent::ToolStart { call_id, .. } => start_handle = Some(call_id),
+                WorkerEvent::ToolResult { call_id, .. } => result_handle = Some(call_id),
+                WorkerEvent::TurnFinished => break,
+                _ => {}
+            }
+        }
+        let start_handle = start_handle.expect("missing tool_start");
+        assert_ne!(start_handle, "raw-provider-id");
+        assert_eq!(result_handle.as_deref(), Some(start_handle.as_str()));
+
+        write_frame(&mut write, &DaemonCommand::Stop).await.unwrap();
+        next_event(&mut reader).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn cancel_aborts_only_active_turn_and_worker_accepts_later_input() {
         let provider = Arc::new(CancelProvider {
             calls: AtomicUsize::new(0),
@@ -1183,24 +1602,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_exits_within_deadline_when_daemon_does_not_drain_events() {
-        let flooded = Arc::new(tokio::sync::Notify::new());
-        let provider = Arc::new(FloodProvider {
-            flooded: Arc::clone(&flooded),
-        });
-        let (_undrained_read, mut write, mut task) = spawn_worker(provider, tools(None)).await;
-
-        write_frame(
-            &mut write,
-            &DaemonCommand::Input {
-                text: "flood".to_owned(),
-            },
-        )
-        .await
-        .unwrap();
-        timeout(Duration::from_secs(1), flooded.notified())
-            .await
-            .expect("provider did not flood events");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_undrained_read, mut write, mut task) = spawn_worker_with_held_event().await;
         write_frame(&mut write, &DaemonCommand::Stop).await.unwrap();
 
         if timeout(Duration::from_secs(1), &mut task).await.is_err() {
@@ -1692,6 +2094,77 @@ mod tests {
             }
         }
 
+        loop {
+            if matches!(next_event(&mut reader).await, WorkerEvent::TurnFinished) {
+                break;
+            }
+        }
+        write_frame(&mut write, &DaemonCommand::Stop).await.unwrap();
+        next_event(&mut reader).await;
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_barrier_preserves_order_under_writer_backpressure() {
+        let held = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(BackpressuredApprovalProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(BackpressureTool {
+            executed: Arc::new(AtomicUsize::new(0)),
+            held: Arc::clone(&held),
+        }));
+        registry.register(Box::new(MutatingTool));
+        let (read, mut write, task) = spawn_worker(provider, Arc::new(registry)).await;
+        write_frame(
+            &mut write,
+            &DaemonCommand::Input {
+                text: "pressure approval".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        timeout(Duration::from_secs(1), held.notified())
+            .await
+            .expect("writer did not become backpressured");
+
+        let mut reader = BufReader::new(read);
+        let mut prior_results = 0;
+        let approval_handle = loop {
+            match next_event(&mut reader).await {
+                WorkerEvent::ToolResult { name, .. } if name == "backpressure" => {
+                    prior_results += 1;
+                }
+                WorkerEvent::NeedsApproval { call_id, tool, .. } => {
+                    assert_eq!(tool, "mutate");
+                    assert_eq!(prior_results, 127);
+                    break call_id;
+                }
+                WorkerEvent::ToolStart { name, .. } if name == "mutate" => {
+                    panic!("approval tool started before its approval request")
+                }
+                _ => {}
+            }
+        };
+
+        write_frame(
+            &mut write,
+            &DaemonCommand::Approve {
+                call_id: approval_handle.clone(),
+                decision: IpcApprovalDecision::Allow,
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            if let WorkerEvent::ToolStart { call_id, name, .. } = next_event(&mut reader).await {
+                if name == "mutate" {
+                    assert_eq!(call_id, approval_handle);
+                    break;
+                }
+            }
+        }
         loop {
             if matches!(next_event(&mut reader).await, WorkerEvent::TurnFinished) {
                 break;
